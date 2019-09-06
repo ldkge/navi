@@ -47,19 +47,24 @@ function _getDates(grain, start, end) {
   return dates;
 }
 
+const dimensionOps = {
+  in: (filterValues, value, field) => filterValues.includes(value[field]),
+  notin: (filterValues, value, field) => !dimensionOps.in(filterValues, value, field),
+  contains: (filterValues, value, field) => filterValues.some(v => value[field].includes(v))
+};
 /**
  * @method _getDimensionValues
  * @param {String} name - dimension to get values for
  * @returns {Array} list of object with id + description
  */
-function _getDimensionValues(name, filterValues) {
+function _getDimensionValues(name, filter) {
   // Return cached values, or fake new ones
   let values =
     DIMENSION_VALUE_MAP[name] ||
     (DIMENSION_VALUE_MAP[name] = _fakeDimensionValues(name, faker.random.number({ min: 3, max: 5 })));
-  return filterValues
+  return filter
     ? values.reduce((arr, value) => {
-        if (filterValues.includes(value.id)) {
+        if (dimensionOps[filter.operation](filter.values, value, filter.field)) {
           arr.push(value);
         }
         return arr;
@@ -96,6 +101,8 @@ function _fakeDimensionValues(name, count) {
   return fakeValues;
 }
 
+const METRIC_ROLLUP_MAP = {};
+
 /**
  * Load fixed dimension values placed under mirage/bard-lite/dimensions
  *
@@ -116,14 +123,16 @@ function _loadPredefinedDimensions() {
 }
 
 export default function(
-  metricBuilder = (metric, row) => {
-    row[metric] = faker.finance.amount();
+  metricBuilder = (metric, row, dimensionKey) => {
+    return faker.finance.amount();
   }
 ) {
   _loadPredefinedDimensions();
 
   this.get('/data/*path', function(db, request) {
+    faker.seed(request.url.length);
     let [table, grain, ...dimensions] = request.params.path.split('/');
+    dimensions = dimensions.filter(d => d.length > 0).sort();
 
     if (table === 'protected') {
       return new Response(403, {}, { error: 'user not allowed to query this table' });
@@ -137,10 +146,15 @@ export default function(
         if (currFilter.length > 0) {
           if (currFilter[0] === ',') currFilter = currFilter.substring(1);
 
-          let dimension = currFilter.split('|')[0],
-            values = currFilter.split('[')[1].split(',');
+          const columnOp = currFilter.split('-');
+          const column = columnOp[0].split('|');
+          const op = columnOp[1].split('[');
+          let dimension = column[0],
+            field = column[1] === 'desc' ? 'description' : column[1],
+            operation = op[0],
+            values = op[1].split(',');
 
-          filterObj[dimension] = values;
+          filterObj[dimension] = { field, operation, values };
         }
 
         return filterObj;
@@ -156,27 +170,70 @@ export default function(
 
     // Add id and desc for each dimension
     dimensions.forEach(dimension => {
-      if (dimension.length > 0) {
-        rows = rows.reduce((newRows, currentRow) => {
-          let dimensionValues = _getDimensionValues(dimension, filters[dimension]);
+      rows = rows.reduce((newRows, currentRow) => {
+        let dimensionValues = _getDimensionValues(dimension, filters[dimension]);
 
-          return newRows.concat(
-            dimensionValues.map(value =>
-              // TODO figure out why Object.assign refuses to work in Phantom even with Babel polyfill
-              assign({}, currentRow, {
-                [`${dimension}|id`]: value.id,
-                [`${dimension}|desc`]: value.description
-              })
-            )
-          );
-        }, []);
-      }
+        return newRows.concat(
+          dimensionValues.map(value =>
+            // TODO figure out why Object.assign refuses to work in Phantom even with Babel polyfill
+            assign({}, currentRow, {
+              [`${dimension}|id`]: value.id,
+              [`${dimension}|desc`]: value.description
+            })
+          )
+        );
+      }, []);
     });
+
+    let havings = {};
+    if (request.queryParams.having) {
+      havings = request.queryParams.having.split(']').reduce((havingObj, currHaving) => {
+        if (currHaving.length > 0) {
+          if (currHaving[0] === ',') currHaving = currHaving.substring(1);
+
+          const rowOp = currHaving.split('-');
+          const op = rowOp[1].split('[');
+          const metric = rowOp[0],
+            operation = op[0],
+            values = op[1].split(',');
+
+          havingObj[metric] = { operation, values };
+        }
+
+        return havingObj;
+      }, filters);
+    }
 
     // Add each metric
-    rows.forEach(row => {
-      request.queryParams.metrics.split(',').forEach(metric => metricBuilder(metric, row));
-    });
+    rows = rows
+      .map(row => {
+        const dimensionKey = dimensions.map(d => `${d}=${row[`${d}|id`]}`).join('_');
+        const metrics = request.queryParams.metrics.split(',').reduce((metricsObj, metric) => {
+          const metricValue = metricBuilder(metric, row, dimensionKey);
+          const havingOps = {
+            gt: (values, metricValue) => parseFloat(metricValue) > parseFloat(values[0]),
+            gte: (values, metricValue) => parseFloat(metricValue) >= parseFloat(values[0]),
+            lt: (values, metricValue) => parseFloat(metricValue) < parseFloat(values[0]),
+            lte: (values, metricValue) => parseFloat(metricValue) <= parseFloat(values[0]),
+            eq: (values, metricValue) => parseFloat(metricValue) == parseFloat(values[0]),
+            neq: (values, metricValue) => parseFloat(metricValue) != parseFloat(values[0]),
+            bet: (values, metricValue) => parseFloat(values[0]) < metricValue && metricValue < parseFloat(values[1]),
+            nbet: (values, metricValue) => !(parseFloat(values[0]) < metricValue && metricValue < parseFloat(values[1]))
+          };
+          const having = havings[metric];
+          if (!having || havingOps[having.operation](having.values, metricValue)) {
+            metricsObj[metric] = metricValue;
+          }
+          return metricsObj;
+        }, {});
+        if (Object.keys(metrics).length > 0) {
+          Object.keys(metrics).forEach(metric => (row[metric] = metrics[metric]));
+          return row;
+        } else {
+          return undefined;
+        }
+      })
+      .filter(r => r !== undefined);
 
     let missingIntervals = request.queryParams.metrics.includes('uniqueIdentifier') ? MISSING_INTERVALS : undefined;
 
